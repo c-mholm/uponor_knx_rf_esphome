@@ -1,0 +1,195 @@
+# =============================================================================
+#  ESPHome – Uponor T-45 KNX RF Thermostat Receiver
+#  Hardware : ESP32 WROOM + CC1101 RF module (868.3 MHz)
+#  ESPHome  : 2025.2 or newer required
+# =============================================================================
+# QUICK START:
+#   1. Replace YOUR_GITHUB_USERNAME below with your actual GitHub username
+#   2. Push all files (including components/ folder) to your GitHub repo
+#   3. Flash with logger level DEBUG and trigger each thermostat
+#   4. Note the serial numbers from the log, fill them in below
+#   5. Rename rooms to match your house
+#   6. Change logger level to INFO, reflash
+# =============================================================================
+
+substitutions:
+  device_name: uponor-knx-rf
+  friendly_name: "Uponor KNX RF"
+
+esphome:
+  name: ${device_name}
+  friendly_name: ${friendly_name}
+
+esp32:
+  board: esp32dev
+  framework:
+    type: arduino
+
+# ---------------------------------------------------------------------------
+# Networking
+# ---------------------------------------------------------------------------
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  # Fallback AP if WiFi is unavailable
+  ap:
+    ssid: "${friendly_name} Fallback"
+    password: !secret ap_password
+
+captive_portal:
+
+# ---------------------------------------------------------------------------
+# Home Assistant API  (encryption key required since HA 2023.2)
+# Generate key: openssl rand -base64 32
+# ---------------------------------------------------------------------------
+api:
+  encryption:
+    key: !secret ha_api_key
+
+# ---------------------------------------------------------------------------
+# OTA updates
+# ---------------------------------------------------------------------------
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+# ---------------------------------------------------------------------------
+# Logging
+# Use DEBUG first run to discover thermostat serial numbers.
+# Switch to INFO once serials are confirmed.
+# ---------------------------------------------------------------------------
+logger:
+  level: DEBUG
+
+# ---------------------------------------------------------------------------
+# External component – loaded from your GitHub repo
+#
+# Replace YOUR_GITHUB_USERNAME with your actual username.
+# The component files must live at:
+#   components/uponor_knx_rf/__init__.py
+#   components/uponor_knx_rf/uponor_knx_rf.h
+#   components/uponor_knx_rf/uponor_knx_rf.cpp
+#   components/uponor_knx_rf/Crc16.h
+# ---------------------------------------------------------------------------
+external_components:
+  - source:
+      type: git
+      url: https://github.com/YOUR_GITHUB_USERNAME/uponor_knx_rf_esphome
+      ref: main
+    components: [uponor_knx_rf]
+    refresh: 1h
+
+# ---------------------------------------------------------------------------
+# CC1101 wiring (ESP32 WROOM default SPI pins):
+#
+#   CC1101       ESP32 WROOM
+#   --------     -----------
+#   VCC      →  3.3 V   (NEVER 5 V!)
+#   GND      →  GND
+#   SI/MOSI  →  GPIO 23
+#   SO/MISO  →  GPIO 19
+#   SCK      →  GPIO 18
+#   CSN/CS   →  GPIO 5
+#   GDO0     →  GPIO 2
+#
+# Adjust pin numbers below if your wiring differs.
+# ---------------------------------------------------------------------------
+uponor_knx_rf:
+  gdo0_pin: 2
+  cs_pin: 5
+  mosi_pin: 23
+  miso_pin: 19
+  sck_pin: 18
+
+  # -------------------------------------------------------------------------
+  # Thermostats
+  #
+  # serial: The 6-byte KNX individual address printed in the debug log.
+  #         Example: "007460AABBCC"  (12 hex characters, no spaces or colons)
+  #         T-45 serials typically start with 00746...
+  #
+  # HOW TO FIND YOUR SERIAL NUMBERS:
+  #   1. Flash this config as-is (placeholder serials are fine)
+  #   2. Open ESPHome logs (logger level must be DEBUG)
+  #   3. Press ▲ or ▼ on each thermostat one at a time
+  #   4. Watch for log lines like:
+  #        [I][uponor_knx_rf]: Unknown serial 007460AABBCC – add it to YAML
+  #   5. Copy each serial, match it to a room, paste below
+  # -------------------------------------------------------------------------
+  thermostats:
+    - serial: "007460AABBCC"   # ← Replace with real serial from debug log
+      name: "Living Room"
+      temperature:
+        name: "Living Room Temperature"
+      setpoint:
+        name: "Living Room Setpoint"
+      battery:
+        name: "Living Room Battery"
+
+    - serial: "007460DDEEFF"
+      name: "Master Bedroom"
+      temperature:
+        name: "Master Bedroom Temperature"
+      setpoint:
+        name: "Master Bedroom Setpoint"
+      battery:
+        name: "Master Bedroom Battery"
+
+    - serial: "007460001122"
+      name: "Kitchen"
+      temperature:
+        name: "Kitchen Temperature"
+      setpoint:
+        name: "Kitchen Setpoint"
+      battery:
+        name: "Kitchen Battery"
+
+    - serial: "007460334455"
+      name: "Bathroom"
+      temperature:
+        name: "Bathroom Temperature"
+      setpoint:
+        name: "Bathroom Setpoint"
+      battery:
+        name: "Bathroom Battery"
+
+    - serial: "007460667788"
+      name: "Children's Room"
+      temperature:
+        name: "Children's Room Temperature"
+      setpoint:
+        name: "Children's Room Setpoint"
+      battery:
+        name: "Children's Room Battery"
+
+    - serial: "00746099AABB"
+      name: "Office"
+      temperature:
+        name: "Office Temperature"
+      setpoint:
+        name: "Office Setpoint"
+      battery:
+        name: "Office Battery"
+
+# ---------------------------------------------------------------------------
+# Diagnostic sensors (optional, but useful)
+# ---------------------------------------------------------------------------
+sensor:
+  - platform: wifi_signal
+    name: "${friendly_name} WiFi Signal"
+    update_interval: 60s
+
+  - platform: uptime
+    name: "${friendly_name} Uptime"
+    update_interval: 60s
+
+text_sensor:
+  - platform: wifi_info
+    ip_address:
+      name: "${friendly_name} IP Address"
+    ssid:
+      name: "${friendly_name} SSID"
+
+binary_sensor:
+  - platform: status
+    name: "${friendly_name} Status"
