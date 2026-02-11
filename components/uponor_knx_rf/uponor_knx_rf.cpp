@@ -26,28 +26,22 @@ void UponorKnxRf::setup() {
 
   ELECHOUSE_cc1101.Init();
 
-  // -----------------------------------------------------------------------
-  // CC1101 configuration for KNX RF 1.1
-  // setCCMode(0) + fixed 64-byte length is the configuration confirmed to
-  // trigger GDO0 on incoming KNX RF bursts (blue LED blinks on receive).
-  // Do NOT change these – setCCMode(1) or variable-length breaks reception.
-  // CRC is handled in software (KNX uses CCITT-16, not CC1101 native CRC).
-  // -----------------------------------------------------------------------
-  ELECHOUSE_cc1101.setModulation(2);   // ASK/OOK
-  ELECHOUSE_cc1101.setCCMode(0);       // Raw capture mode – required for KNX RF
-  ELECHOUSE_cc1101.setMHZ(868.3);      // KNX RF EU frequency (433.92 for some regions)
+  // KNX RF 1.1 Europe: 868.3 MHz, OOK/ASK modulation
+  // Change to 433.92 if your region uses 433 MHz
+  ELECHOUSE_cc1101.setMHZ(868.3);
+  ELECHOUSE_cc1101.setModulation(2);   // OOK/ASK
+  ELECHOUSE_cc1101.setCCMode(0);
   ELECHOUSE_cc1101.setSyncMode(2);     // 16-bit sync word
-  ELECHOUSE_cc1101.setCrc(0);          // Disable hardware CRC; we validate with CCITT-16
-  ELECHOUSE_cc1101.setLengthConfig(0); // Fixed-length mode
-  ELECHOUSE_cc1101.setPacketLength(PKT_MAX_LEN); // 64 bytes captures full KNX RF frame
-  ELECHOUSE_cc1101.setPktFormat(0);    // Normal FIFO mode
+  ELECHOUSE_cc1101.setCrc(0);          // We do CRC validation ourselves (KNX CCITT)
+  ELECHOUSE_cc1101.setLengthConfig(0); // Fixed-length packets
+  ELECHOUSE_cc1101.setPacketLength(PKT_MAX_LEN);
+  ELECHOUSE_cc1101.setPktFormat(0);
   ELECHOUSE_cc1101.setPA(12);
 
   ELECHOUSE_cc1101.SetRx();
 
   cc1101_ok_ = true;
-  ESP_LOGCONFIG(TAG, "CC1101 ready – listening at 868.3 MHz (KNX RF 1.1)");
-  ESP_LOGI(TAG, ">>> Trigger a thermostat now – every received packet will be logged below <<<");
+  ESP_LOGCONFIG(TAG, "CC1101 listening on 868.3 MHz (KNX RF 1.1)");
 }
 
 // ---------------------------------------------------------------------------
@@ -69,10 +63,28 @@ void UponorKnxRf::dump_config() {
 // loop()
 // ---------------------------------------------------------------------------
 void UponorKnxRf::loop() {
+  // Re-log CC1101 status on first loop() call so the API log stream catches it
+  if (first_loop_) {
+    first_loop_ = false;
+    if (cc1101_ok_) {
+      ESP_LOGI(TAG, "CC1101 is OK – listening on 868.3 MHz. Press thermostat buttons to discover serials.");
+    } else {
+      ESP_LOGE(TAG, "CC1101 FAILED at boot – check SPI wiring (GDO0=%d CS=%d MOSI=%d MISO=%d SCK=%d) and 3.3V power",
+               gdo0_pin_, cs_pin_, mosi_pin_, miso_pin_, sck_pin_);
+    }
+  }
+
   if (!cc1101_ok_) return;
 
-  // 100ms matches the original working configuration.
-  // CheckRxFifo internally calls delay(t) and polls GDO0/RSSI.
+  // Periodic status heartbeat every 30 s
+  uint32_t now = millis();
+  if (now - last_status_log_ > 30000) {
+    last_status_log_ = now;
+    ESP_LOGI(TAG, "Status: %u packets received, %u unknown serials seen",
+             packet_count_, unknown_serial_count_);
+  }
+
+  // CheckRxFifo returns true when GDO0 goes high (packet received)
   if (ELECHOUSE_cc1101.CheckRxFifo(100)) {
     receive_and_process_();
   }
@@ -82,47 +94,41 @@ void UponorKnxRf::loop() {
 // receive_and_process_()
 // ---------------------------------------------------------------------------
 void UponorKnxRf::receive_and_process_() {
-  // This line prints at INFO every time CheckRxFifo says data is ready.
-  // If you see "FIFO triggered" but NO "RAW RX" line below it, ReceiveData
-  // returned len=0 (noise burst, not a real packet).
-  ESP_LOGI(TAG, "--- FIFO triggered, reading packet ---");
-
   uint8_t buf[PKT_MAX_LEN + 2];
   memset(buf, 0, sizeof(buf));
 
   int len = ELECHOUSE_cc1101.ReceiveData(buf);
 
-  ELECHOUSE_cc1101.SetRx();  // Re-arm receiver immediately after every read
-
-  // --- Always print raw bytes at INFO level until serials are known -------
-  // We use INFO (not DEBUG) so this is visible even without changing logger
-  // level, and it's not gated by a compile-time constant.
-  {
-    char hex[PKT_MAX_LEN * 3 + 8];
-    int  pos = 0;
-    for (int i = 0; i < len && i < PKT_MAX_LEN; i++) {
-      pos += snprintf(hex + pos, sizeof(hex) - pos, "%02X ", buf[i]);
-    }
-    ESP_LOGI(TAG, "RAW RX [%d bytes]: %s", len, hex);
-  }
+  ELECHOUSE_cc1101.SetRx();  // Re-arm receiver immediately
 
   if (len < PKT_MIN_LEN) {
-    ESP_LOGI(TAG, "  ^ Short packet (%d bytes) – noise or truncated, skipping parse", len);
+    ESP_LOGD(TAG, "Ignored short packet (%d bytes)", len);
     return;
   }
 
-  // --- Log byte[1] to help identify KNX frame type -----------------------
-  // KNX RF 1.1 data frames have byte[1]=0x44. But we intentionally do NOT
-  // drop other values here – we log them so you can see what the T-45 sends.
-  if (buf[1] != 0x44) {
-    ESP_LOGI(TAG, "  ^ byte[1]=0x%02X (expected 0x44 for KNX RF 1.1 – still extracting serial)", buf[1]);
+  packet_count_++;
+
+  // Always log full raw hex at DEBUG level so users can find their serial numbers
+  if (ESPHOME_LOG_LEVEL >= ESPHOME_LOG_LEVEL_DEBUG) {
+    char hex[PKT_MAX_LEN * 3 + 4];
+    int  pos = 0;
+    for (int i = 0; i < len; i++) {
+      pos += snprintf(hex + pos, sizeof(hex) - pos, "%02X ", buf[i]);
+    }
+    ESP_LOGD(TAG, "RX [%d bytes]: %s", len, hex);
   }
 
-  // --- Extract and log the serial regardless of byte[1] ------------------
-  std::string serial = extract_serial_(buf);
-  ESP_LOGI(TAG, "  ^ Serial bytes [4-9]: %s  <-- copy this into your YAML", serial.c_str());
+  // Check fixed KNX RF 1.1 byte at offset 1 (should be 0x44)
+  if (buf[1] != 0x44) {
+    ESP_LOGD(TAG, "Not a KNX RF 1.1 frame (byte[1]=0x%02X)", buf[1]);
+    return;
+  }
 
-  // --- Now try to find a matching configured thermostat ------------------
+  // Extract 6-byte serial → 12-char hex string
+  std::string serial = extract_serial_(buf);
+  ESP_LOGD(TAG, "Packet serial: %s", serial.c_str());
+
+  // Find matching thermostat
   ThermostatEntry *matched = nullptr;
   for (auto &t : thermostats_) {
     if (t.serial_hex == serial) {
@@ -132,21 +138,23 @@ void UponorKnxRf::receive_and_process_() {
   }
 
   if (!matched) {
-    ESP_LOGI(TAG, "  ^ No match in config. Add serial '%s' to uponor_knx_rf.yaml", serial.c_str());
+    unknown_serial_count_++;
+    // This is intentionally INFO so new serials are visible even at INFO log level
+    ESP_LOGI(TAG, "Unknown serial %s – if this is your T-45, add it to the YAML", serial.c_str());
     return;
   }
 
-  // --- CRC check ---------------------------------------------------------
+  // Validate CRC (last 2 bytes are CRC over all preceding bytes)
   if (!validate_packet_(buf, (uint8_t)len)) {
     ESP_LOGW(TAG, "[%s] CRC error – packet discarded", matched->room_name.c_str());
     return;
   }
 
-  // --- Decode temperatures -----------------------------------------------
+  // Decode temperatures
   float temperature = NAN;
   float setpoint    = NAN;
   if (!decode_dpt9_pair_(buf, (uint8_t)len, temperature, setpoint)) {
-    ESP_LOGW(TAG, "[%s] Temperature decode failed (packet len=%d)", matched->room_name.c_str(), len);
+    ESP_LOGW(TAG, "[%s] Temperature decode failed", matched->room_name.c_str());
     return;
   }
 
@@ -156,7 +164,7 @@ void UponorKnxRf::receive_and_process_() {
   ESP_LOGI(TAG, "[%s] temp=%.2f°C  setpoint=%.2f°C  battery=%s",
            matched->room_name.c_str(),
            temperature, setpoint,
-           battery_ok > 0.0f ? "OK" : "LOW");
+           battery_ok > 0 ? "OK" : "LOW");
 
   if (matched->temperature && !std::isnan(temperature))
     matched->temperature->publish_state(temperature);

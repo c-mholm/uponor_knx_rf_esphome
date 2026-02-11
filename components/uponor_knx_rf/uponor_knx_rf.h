@@ -103,6 +103,10 @@ class UponorKnxRf : public Component {
 
   std::vector<ThermostatEntry> thermostats_;
   bool cc1101_ok_{false};
+  bool first_loop_{true};
+  uint32_t packet_count_{0};
+  uint32_t unknown_serial_count_{0};
+  uint32_t last_status_log_{0};
 };
 
 }  // namespace uponor_knx_rf
