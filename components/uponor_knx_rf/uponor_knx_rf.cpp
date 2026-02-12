@@ -48,7 +48,10 @@ void UponorKnxRf::setup() {
   ELECHOUSE_cc1101.setPacketLength(61);       // Max packet length
 
   // Direct register writes for optimal KNX RF reception
-  // These fine-tune AGC, frequency offset compensation, bit sync, etc.
+  // Note: setCCMode(1) sets PKTCTRL0=0x05 (variable length + CRC enabled).
+  // The reference implementation uses the same setting and it works.
+  // CC1101 CRC auto-flush is disabled by default (PKTCTRL1 bit 3 = 0),
+  // so bad-CRC packets still stay in the FIFO — they just fail CheckCRC().
   ELECHOUSE_cc1101.SpiWriteReg(0x03, 0x40);  // FIFOTHR: RX FIFO threshold
   ELECHOUSE_cc1101.SpiWriteReg(0x0B, 0x08);  // FSCTRL1: IF frequency
   ELECHOUSE_cc1101.SpiWriteReg(0x0C, 0x00);  // FSCTRL0: frequency offset
@@ -70,6 +73,18 @@ void UponorKnxRf::setup() {
 
   cc1101_ok_ = true;
   ESP_LOGCONFIG(TAG, "CC1101 listening on 868.3 MHz (KNX RF 1.1, 2-FSK, 32.73 kBaud)");
+
+  // Dump key registers for debugging
+  ESP_LOGI(TAG, "CC1101 registers: MDMCFG4=0x%02X MDMCFG3=0x%02X MDMCFG2=0x%02X MDMCFG1=0x%02X",
+           ELECHOUSE_cc1101.SpiReadReg(0x10), ELECHOUSE_cc1101.SpiReadReg(0x11),
+           ELECHOUSE_cc1101.SpiReadReg(0x12), ELECHOUSE_cc1101.SpiReadReg(0x13));
+  ESP_LOGI(TAG, "CC1101 registers: SYNC1=0x%02X SYNC0=0x%02X PKTCTRL0=0x%02X PKTCTRL1=0x%02X PKTLEN=0x%02X",
+           ELECHOUSE_cc1101.SpiReadReg(0x04), ELECHOUSE_cc1101.SpiReadReg(0x05),
+           ELECHOUSE_cc1101.SpiReadReg(0x08), ELECHOUSE_cc1101.SpiReadReg(0x07),
+           ELECHOUSE_cc1101.SpiReadReg(0x06));
+  ESP_LOGI(TAG, "CC1101 registers: DEVIATN=0x%02X FREND1=0x%02X AGCCTRL2=0x%02X IOCFG0=0x%02X",
+           ELECHOUSE_cc1101.SpiReadReg(0x15), ELECHOUSE_cc1101.SpiReadReg(0x21),
+           ELECHOUSE_cc1101.SpiReadReg(0x1B), ELECHOUSE_cc1101.SpiReadReg(0x02));
 }
 
 // ---------------------------------------------------------------------------
@@ -103,14 +118,23 @@ void UponorKnxRf::loop() {
 
   if (!cc1101_ok_) return;
 
-  // Periodic status heartbeat every 30 s
+  // Periodic status heartbeat every 30 s — include CC1101 state for diagnostics
   uint32_t now = millis();
   if (now - last_status_log_ > 30000) {
     last_status_log_ = now;
-    ESP_LOGI(TAG, "Status: %u packets received, %u unknown serials seen",
-             packet_count_, unknown_serial_count_);
+    byte rxbytes = ELECHOUSE_cc1101.SpiReadStatus(0x3B);  // CC1101_RXBYTES
+    byte marcstate = ELECHOUSE_cc1101.SpiReadStatus(0x35); // CC1101_MARCSTATE
+    ESP_LOGI(TAG, "Status: %u packets received, %u unknown serials | RXBYTES=%d MARCSTATE=0x%02X",
+             packet_count_, unknown_serial_count_, rxbytes, marcstate);
+    // MARCSTATE: 0x0D = RX (good), 0x01 = IDLE, 0x11 = RX_OVERFLOW
+    if ((marcstate & 0x1F) != 0x0D) {
+      ESP_LOGW(TAG, "CC1101 not in RX state (0x%02X) – re-arming", marcstate);
+      ELECHOUSE_cc1101.SetRx();
+    }
   }
 
+  // Note: Do NOT call CheckCRC() before ReceiveData — it flushes the FIFO on
+  // CRC failure, and KNX RF Manchester-encoded packets may not pass CC1101 CRC.
   if (ELECHOUSE_cc1101.CheckRxFifo(100)) {
     receive_and_process_();
   }
