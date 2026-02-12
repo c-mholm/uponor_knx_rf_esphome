@@ -34,6 +34,8 @@ void UponorKnxRf::setup() {
   // Frequency deviation: 47.6 kHz
   // RX bandwidth: 270 kHz
   // Sync word: 0x7696 (KNX RF RX sync)
+  // High-level API calls set the basic radio parameters.
+  // setCCMode(1) must be first as it overwrites several registers.
   ELECHOUSE_cc1101.setCCMode(1);
   ELECHOUSE_cc1101.setModulation(0);          // 0 = 2-FSK
   ELECHOUSE_cc1101.setMHZ(868.3);
@@ -43,48 +45,51 @@ void UponorKnxRf::setup() {
   ELECHOUSE_cc1101.setRxBW(270.833333);
   ELECHOUSE_cc1101.setDRate(32.7301);
   ELECHOUSE_cc1101.setPA(5);
-  ELECHOUSE_cc1101.setSyncMode(5);            // 15/16 sync + carrier sense
+  ELECHOUSE_cc1101.setSyncMode(2);            // 16/16 sync word match
   ELECHOUSE_cc1101.setSyncWord(0x76, 0x96);   // KNX RF RX sync word
   ELECHOUSE_cc1101.setPacketLength(61);       // Max packet length
 
-  // Direct register writes for optimal KNX RF reception
-  // Note: setCCMode(1) sets PKTCTRL0=0x05 (variable length + CRC enabled).
-  // The reference implementation uses the same setting and it works.
-  // CC1101 CRC auto-flush is disabled by default (PKTCTRL1 bit 3 = 0),
-  // so bad-CRC packets still stay in the FIFO — they just fail CheckCRC().
-  ELECHOUSE_cc1101.SpiWriteReg(0x03, 0x40);  // FIFOTHR: RX FIFO threshold
+  // Direct register writes — belt-and-braces to guarantee correct config.
+  // These are written AFTER the high-level API calls, so they take precedence.
+  // Register values match the proven tahvane1/uponor_knx_rf_thermostat and
+  // thelsing/knx reference implementations.
+  ELECHOUSE_cc1101.SpiWriteReg(0x02, 0x06);  // IOCFG0:  GDO0 = sync word sent/received
+  ELECHOUSE_cc1101.SpiWriteReg(0x03, 0x47);  // FIFOTHR: RX FIFO threshold = 33 bytes
+  ELECHOUSE_cc1101.SpiWriteReg(0x04, 0x76);  // SYNC1:   sync word high
+  ELECHOUSE_cc1101.SpiWriteReg(0x05, 0x96);  // SYNC0:   sync word low
+  ELECHOUSE_cc1101.SpiWriteReg(0x06, 0x3D);  // PKTLEN:  max packet length = 61
+  ELECHOUSE_cc1101.SpiWriteReg(0x07, 0x04);  // PKTCTRL1: append status, no addr check
+  ELECHOUSE_cc1101.SpiWriteReg(0x08, 0x05);  // PKTCTRL0: variable length, CRC enabled
   ELECHOUSE_cc1101.SpiWriteReg(0x0B, 0x08);  // FSCTRL1: IF frequency
   ELECHOUSE_cc1101.SpiWriteReg(0x0C, 0x00);  // FSCTRL0: frequency offset
-  ELECHOUSE_cc1101.SpiWriteReg(0x13, 0x22);  // MDMCFG1: preamble + channel spacing exp
-  ELECHOUSE_cc1101.SpiWriteReg(0x15, 0x47);  // DEVIATN: deviation
-  ELECHOUSE_cc1101.SpiWriteReg(0x17, 0x30);  // MCSM1: CCA mode, after RX/TX state
-  ELECHOUSE_cc1101.SpiWriteReg(0x19, 0x2E);  // FOCCFG: frequency offset compensation
-  ELECHOUSE_cc1101.SpiWriteReg(0x1A, 0x6D);  // BSCFG: bit synchronization
-  ELECHOUSE_cc1101.SpiWriteReg(0x1B, 0x43);  // AGCCTRL2: AGC max gain
-  ELECHOUSE_cc1101.SpiWriteReg(0x1C, 0x40);  // AGCCTRL1: AGC LNA priority
-  ELECHOUSE_cc1101.SpiWriteReg(0x1D, 0x91);  // AGCCTRL0: AGC filter samples
-  ELECHOUSE_cc1101.SpiWriteReg(0x21, 0xB6);  // FREND1: front end RX
+  ELECHOUSE_cc1101.SpiWriteReg(0x10, 0x6A);  // MDMCFG4: RxBW=270kHz, DRate exp=0x0A
+  ELECHOUSE_cc1101.SpiWriteReg(0x11, 0x4A);  // MDMCFG3: DRate mantissa → 32.73 kBaud
+  ELECHOUSE_cc1101.SpiWriteReg(0x12, 0x02);  // MDMCFG2: 2-FSK, Manchester OFF, 16/16 sync
+  ELECHOUSE_cc1101.SpiWriteReg(0x13, 0x22);  // MDMCFG1: 4 preamble bytes, chanspc exp
+  ELECHOUSE_cc1101.SpiWriteReg(0x15, 0x47);  // DEVIATN: 47.6 kHz deviation
+  ELECHOUSE_cc1101.SpiWriteReg(0x17, 0x30);  // MCSM1:   CCA mode, after RX/TX state
+  ELECHOUSE_cc1101.SpiWriteReg(0x18, 0x18);  // MCSM0:   auto-cal IDLE→RX/TX
+  ELECHOUSE_cc1101.SpiWriteReg(0x19, 0x2E);  // FOCCFG:  frequency offset compensation
+  ELECHOUSE_cc1101.SpiWriteReg(0x1A, 0x6D);  // BSCFG:   bit synchronization
+  ELECHOUSE_cc1101.SpiWriteReg(0x1B, 0x43);  // AGCCTRL2: AGC target 33 dB
+  ELECHOUSE_cc1101.SpiWriteReg(0x1C, 0x40);  // AGCCTRL1: LNA priority
+  ELECHOUSE_cc1101.SpiWriteReg(0x1D, 0x91);  // AGCCTRL0: filter samples = 16
   ELECHOUSE_cc1101.SpiWriteReg(0x20, 0xFB);  // WORCTRL: WOR control
-  ELECHOUSE_cc1101.SpiWriteReg(0x23, 0xEF);  // FSCAL3: freq synth cal
-  ELECHOUSE_cc1101.SpiWriteReg(0x24, 0x2E);  // FSCAL2: freq synth cal
-  ELECHOUSE_cc1101.SpiWriteReg(0x25, 0x19);  // FSCAL1: freq synth cal
+  ELECHOUSE_cc1101.SpiWriteReg(0x21, 0xB6);  // FREND1:  front end RX
+  ELECHOUSE_cc1101.SpiWriteReg(0x22, 0x10);  // FREND0:  front end TX (FSK)
+  ELECHOUSE_cc1101.SpiWriteReg(0x23, 0xE9);  // FSCAL3:  freq synth cal
+  ELECHOUSE_cc1101.SpiWriteReg(0x24, 0x2A);  // FSCAL2:  freq synth cal
+  ELECHOUSE_cc1101.SpiWriteReg(0x25, 0x00);  // FSCAL1:  freq synth cal
+  ELECHOUSE_cc1101.SpiWriteReg(0x26, 0x1F);  // FSCAL0:  freq synth cal
+  ELECHOUSE_cc1101.SpiWriteReg(0x29, 0x59);  // FSTEST:  freq synth test
+  ELECHOUSE_cc1101.SpiWriteReg(0x2C, 0x81);  // TEST2:   test setting
+  ELECHOUSE_cc1101.SpiWriteReg(0x2D, 0x35);  // TEST1:   test setting
+  ELECHOUSE_cc1101.SpiWriteReg(0x2E, 0x09);  // TEST0:   test setting
 
   ELECHOUSE_cc1101.SetRx();
 
   cc1101_ok_ = true;
   ESP_LOGCONFIG(TAG, "CC1101 listening on 868.3 MHz (KNX RF 1.1, 2-FSK, 32.73 kBaud)");
-
-  // Dump key registers for debugging
-  ESP_LOGI(TAG, "CC1101 registers: MDMCFG4=0x%02X MDMCFG3=0x%02X MDMCFG2=0x%02X MDMCFG1=0x%02X",
-           ELECHOUSE_cc1101.SpiReadReg(0x10), ELECHOUSE_cc1101.SpiReadReg(0x11),
-           ELECHOUSE_cc1101.SpiReadReg(0x12), ELECHOUSE_cc1101.SpiReadReg(0x13));
-  ESP_LOGI(TAG, "CC1101 registers: SYNC1=0x%02X SYNC0=0x%02X PKTCTRL0=0x%02X PKTCTRL1=0x%02X PKTLEN=0x%02X",
-           ELECHOUSE_cc1101.SpiReadReg(0x04), ELECHOUSE_cc1101.SpiReadReg(0x05),
-           ELECHOUSE_cc1101.SpiReadReg(0x08), ELECHOUSE_cc1101.SpiReadReg(0x07),
-           ELECHOUSE_cc1101.SpiReadReg(0x06));
-  ESP_LOGI(TAG, "CC1101 registers: DEVIATN=0x%02X FREND1=0x%02X AGCCTRL2=0x%02X IOCFG0=0x%02X",
-           ELECHOUSE_cc1101.SpiReadReg(0x15), ELECHOUSE_cc1101.SpiReadReg(0x21),
-           ELECHOUSE_cc1101.SpiReadReg(0x1B), ELECHOUSE_cc1101.SpiReadReg(0x02));
 }
 
 // ---------------------------------------------------------------------------
@@ -110,6 +115,20 @@ void UponorKnxRf::loop() {
     first_loop_ = false;
     if (cc1101_ok_) {
       ESP_LOGI(TAG, "CC1101 is OK – listening on 868.3 MHz (2-FSK). Press thermostat buttons to discover serials.");
+      // Dump registers here (not in setup) so they appear in the API log stream
+      ESP_LOGI(TAG, "Regs: MDMCFG4=0x%02X MDMCFG3=0x%02X MDMCFG2=0x%02X MDMCFG1=0x%02X",
+               ELECHOUSE_cc1101.SpiReadReg(0x10), ELECHOUSE_cc1101.SpiReadReg(0x11),
+               ELECHOUSE_cc1101.SpiReadReg(0x12), ELECHOUSE_cc1101.SpiReadReg(0x13));
+      ESP_LOGI(TAG, "Regs: SYNC1=0x%02X SYNC0=0x%02X PKTCTRL0=0x%02X PKTCTRL1=0x%02X PKTLEN=0x%02X",
+               ELECHOUSE_cc1101.SpiReadReg(0x04), ELECHOUSE_cc1101.SpiReadReg(0x05),
+               ELECHOUSE_cc1101.SpiReadReg(0x08), ELECHOUSE_cc1101.SpiReadReg(0x07),
+               ELECHOUSE_cc1101.SpiReadReg(0x06));
+      ESP_LOGI(TAG, "Regs: DEVIATN=0x%02X FREND1=0x%02X AGCCTRL2=0x%02X IOCFG0=0x%02X FSCAL3=0x%02X",
+               ELECHOUSE_cc1101.SpiReadReg(0x15), ELECHOUSE_cc1101.SpiReadReg(0x21),
+               ELECHOUSE_cc1101.SpiReadReg(0x1B), ELECHOUSE_cc1101.SpiReadReg(0x02),
+               ELECHOUSE_cc1101.SpiReadReg(0x23));
+      byte marcstate = ELECHOUSE_cc1101.SpiReadStatus(0x35);
+      ESP_LOGI(TAG, "Regs: MARCSTATE=0x%02X (should be 0x0D=RX)", marcstate);
     } else {
       ESP_LOGE(TAG, "CC1101 FAILED at boot – check SPI wiring (GDO0=%d CS=%d MOSI=%d MISO=%d SCK=%d) and 3.3V power",
                gdo0_pin_, cs_pin_, mosi_pin_, miso_pin_, sck_pin_);
