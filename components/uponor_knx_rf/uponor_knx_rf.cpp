@@ -57,9 +57,9 @@ void UponorKnxRf::setup() {
   ELECHOUSE_cc1101.SpiWriteReg(0x03, 0x47);  // FIFOTHR: RX FIFO threshold = 33 bytes
   ELECHOUSE_cc1101.SpiWriteReg(0x04, 0x76);  // SYNC1:   sync word high
   ELECHOUSE_cc1101.SpiWriteReg(0x05, 0x96);  // SYNC0:   sync word low
-  ELECHOUSE_cc1101.SpiWriteReg(0x06, 0x3D);  // PKTLEN:  max packet length = 61
-  ELECHOUSE_cc1101.SpiWriteReg(0x07, 0x04);  // PKTCTRL1: append status, no addr check
-  ELECHOUSE_cc1101.SpiWriteReg(0x08, 0x05);  // PKTCTRL0: variable length, CRC enabled
+  ELECHOUSE_cc1101.SpiWriteReg(0x06, 0x3D);  // PKTLEN:  fixed packet length = 61 bytes
+  ELECHOUSE_cc1101.SpiWriteReg(0x07, 0x00);  // PKTCTRL1: no append status, no addr check
+  ELECHOUSE_cc1101.SpiWriteReg(0x08, 0x00);  // PKTCTRL0: fixed length, CRC OFF, no whitening
   ELECHOUSE_cc1101.SpiWriteReg(0x0B, 0x08);  // FSCTRL1: IF frequency
   ELECHOUSE_cc1101.SpiWriteReg(0x0C, 0x00);  // FSCTRL0: frequency offset
   ELECHOUSE_cc1101.SpiWriteReg(0x10, 0x6A);  // MDMCFG4: RxBW=270kHz, DRate exp=0x0A
@@ -152,9 +152,18 @@ void UponorKnxRf::loop() {
     }
   }
 
-  // Note: Do NOT call CheckCRC() before ReceiveData — it flushes the FIFO on
-  // CRC failure, and KNX RF Manchester-encoded packets may not pass CC1101 CRC.
-  if (ELECHOUSE_cc1101.CheckRxFifo(100)) {
+  // Check if there are bytes in the RX FIFO (direct register read, not library call)
+  byte rxbytes_now = ELECHOUSE_cc1101.SpiReadStatus(0x3B) & 0x7F;
+  if (rxbytes_now > 0) {
+    // Wait for the full packet to arrive. At 32.73 kBaud, 61 bytes takes ~15ms.
+    // Wait up to 25ms, checking every 5ms for no new bytes (end of packet).
+    byte prev = rxbytes_now;
+    for (int wait = 0; wait < 5; wait++) {
+      delay(5);
+      byte cur = ELECHOUSE_cc1101.SpiReadStatus(0x3B) & 0x7F;
+      if (cur == prev) break;  // No new bytes → packet complete
+      prev = cur;
+    }
     receive_and_process_();
   }
 }
@@ -201,9 +210,16 @@ void UponorKnxRf::receive_and_process_() {
   uint8_t raw_buf[RAW_BUF_LEN];
   memset(raw_buf, 0, sizeof(raw_buf));
 
-  int raw_len = ELECHOUSE_cc1101.ReceiveData(raw_buf);
-
-  ELECHOUSE_cc1101.SetRx();  // Re-arm receiver immediately
+  // Read FIFO directly — we use fixed-length mode so ReceiveData() won't work
+  // (it assumes variable-length where first byte = length)
+  byte rxbytes = ELECHOUSE_cc1101.SpiReadStatus(0x3B) & 0x7F;  // RXBYTES, mask overflow bit
+  int raw_len = (rxbytes > RAW_BUF_LEN) ? RAW_BUF_LEN : rxbytes;
+  if (raw_len > 0) {
+    ELECHOUSE_cc1101.SpiReadBurstReg(0x3F, raw_buf, raw_len);  // 0x3F = CC1101_RXFIFO
+  }
+  // Flush FIFO and re-arm receiver
+  ELECHOUSE_cc1101.SpiStrobe(0x3A);  // SFRX — flush RX FIFO
+  ELECHOUSE_cc1101.SetRx();          // Re-arm receiver
 
   if (raw_len < RAW_MIN_LEN || raw_len > RAW_BUF_LEN) {
     ESP_LOGD(TAG, "Ignored packet (%d raw bytes)", raw_len);
