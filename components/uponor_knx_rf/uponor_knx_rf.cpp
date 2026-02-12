@@ -349,13 +349,18 @@ void UponorKnxRf::receive_and_process_() {
     ESP_LOGD(TAG, "[%s] KNX frame [%d]: %s", matched->room_name.c_str(), knx_len, hex);
   }
 
-  // Extract data value from bytes 20-21 (DPT 9.001 two-byte float).
-  // The datapoint type (byte 16) tells us whether this is temperature or setpoint.
+  // Extract data value from bytes 20-21.
+  // Uponor thermostats use a simplified encoding (NOT standard DPT 9.001):
+  //   If bit 11 (0x800) is set: value = ((raw & 0x7FF) * 2) / 100.0
+  //   If bit 11 is clear:       value = raw / 100.0
+  // This is transform_temperature_() from the tahvane1 reference implementation.
+  // Standard decode_dpt9_() gives wrong results because the exponent/mantissa
+  // fields are NOT used in the standard way by these thermostats.
   float value = NAN;
   if (knx_len >= 22 && (datapoint == 1 || datapoint == 2)) {
     uint16_t raw_val = ((uint16_t)knx[20] << 8) | knx[21];
     if (raw_val != DPT9_INVALID && raw_val != 0x0000) {
-      value = decode_dpt9_(knx[20], knx[21]);
+      value = (float)transform_temperature_(raw_val) / 100.0f;
     }
   }
 
