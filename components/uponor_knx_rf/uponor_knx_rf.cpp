@@ -303,12 +303,23 @@ void UponorKnxRf::receive_and_process_() {
   // Extract 6-byte serial (bytes 4..9 of KNX frame)
   std::string serial = extract_serial_(knx);
 
-  // Battery: RF-Info byte 3, bit 6 (1=OK, 0=low)
-  float battery_ok = (knx[3] & 0x40) ? 1.0f : 0.0f;
+  // Battery: RF-Info byte 3, bit 1 (mask 0x02): 1=OK, 0=LOW
+  // Confirmed by tahvane1, aviborg/MonitorKNXRF, and thelsing/knx implementations.
+  // Bit 0 (0x01) = unidirectional device flag.
+  float battery_ok = (knx[3] & 0x02) ? 1.0f : 0.0f;
 
-  ESP_LOGI(TAG, "KNX packet: serial=%s battery=%s via=%s offset=%d len=%d",
+  // Determine the datapoint type from destination address low byte (byte 16).
+  // Uponor thermostats send temperature and setpoint as SEPARATE telegrams:
+  //   dp=1 → current temperature (2 bytes at offset 20-21)
+  //   dp=2 → setpoint temperature (2 bytes at offset 20-21)
+  //   dp=3 → status/mode (1 byte at offset 20, L-field=0x12)
+  // Bytes 22-23 are the Block 2 CRC, NOT a second data value!
+  uint8_t datapoint = (knx_len > 16) ? knx[16] : 0;
+
+  ESP_LOGI(TAG, "KNX packet: serial=%s battery=%s dp=%d via=%s offset=%d len=%d",
            serial.c_str(),
            battery_ok > 0 ? "OK" : "LOW",
+           datapoint,
            used_manchester ? "manchester" : "raw",
            used_manchester ? man_knx_offset : raw_knx_offset,
            knx_len);
@@ -328,7 +339,7 @@ void UponorKnxRf::receive_and_process_() {
     return;
   }
 
-  // Log full KNX frame for debugging temperature offsets
+  // Log full KNX frame for debugging
   {
     char hex[DECODED_BUF_LEN * 3 + 4];
     int pos = 0;
@@ -338,46 +349,54 @@ void UponorKnxRf::receive_and_process_() {
     ESP_LOGD(TAG, "[%s] KNX frame [%d]: %s", matched->room_name.c_str(), knx_len, hex);
   }
 
-  // Extract temperature data
-  // Reference implementation uses offsets 20,21 for temp and 22,23 for setpoint
-  // relative to the KNX frame start. These offsets span across block boundaries
-  // (first block = 10 data + 2 CRC = 12 bytes, second block = 16 data + 2 CRC = 18 bytes).
-  float temperature = NAN;
-  float setpoint = NAN;
-
-  if (knx_len >= 22) {
-    uint16_t raw_temp = ((uint16_t)knx[20] << 8) | knx[21];
-    if (raw_temp != DPT9_INVALID && raw_temp != 0x0000) {
-      temperature = (float)transform_temperature_(raw_temp) / 100.0f;
-    }
-  }
-  if (knx_len >= 24) {
-    uint16_t raw_setp = ((uint16_t)knx[22] << 8) | knx[23];
-    if (raw_setp != DPT9_INVALID && raw_setp != 0x0000) {
-      setpoint = (float)transform_temperature_(raw_setp) / 100.0f;
+  // Extract data value from bytes 20-21 (DPT 9.001 two-byte float).
+  // The datapoint type (byte 16) tells us whether this is temperature or setpoint.
+  float value = NAN;
+  if (knx_len >= 22 && (datapoint == 1 || datapoint == 2)) {
+    uint16_t raw_val = ((uint16_t)knx[20] << 8) | knx[21];
+    if (raw_val != DPT9_INVALID && raw_val != 0x0000) {
+      value = decode_dpt9_(knx[20], knx[21]);
     }
   }
 
   // Sanity bounds
-  if (!std::isnan(temperature) && (temperature < -20.0f || temperature > 60.0f)) {
-    ESP_LOGW(TAG, "[%s] Temperature %.2f out of range", matched->room_name.c_str(), temperature);
-    temperature = NAN;
+  if (!std::isnan(value)) {
+    if (datapoint == 1 && (value < -20.0f || value > 60.0f)) {
+      ESP_LOGW(TAG, "[%s] Temperature %.2f out of range, raw=0x%02X%02X",
+               matched->room_name.c_str(), value, knx[20], knx[21]);
+      value = NAN;
+    } else if (datapoint == 2 && (value < 0.0f || value > 45.0f)) {
+      ESP_LOGW(TAG, "[%s] Setpoint %.2f out of range, raw=0x%02X%02X",
+               matched->room_name.c_str(), value, knx[20], knx[21]);
+      value = NAN;
+    }
   }
-  if (!std::isnan(setpoint) && (setpoint < 0.0f || setpoint > 45.0f)) {
-    ESP_LOGW(TAG, "[%s] Setpoint %.2f out of range", matched->room_name.c_str(), setpoint);
-    setpoint = NAN;
+
+  // Publish based on datapoint type
+  if (datapoint == 1) {
+    ESP_LOGI(TAG, "[%s] temperature=%.2f°C  battery=%s  (raw=0x%02X%02X)",
+             matched->room_name.c_str(), value,
+             battery_ok > 0 ? "OK" : "LOW",
+             knx_len >= 22 ? knx[20] : 0, knx_len >= 22 ? knx[21] : 0);
+    if (matched->temperature && !std::isnan(value))
+      matched->temperature->publish_state(value);
+  } else if (datapoint == 2) {
+    ESP_LOGI(TAG, "[%s] setpoint=%.2f°C  battery=%s  (raw=0x%02X%02X)",
+             matched->room_name.c_str(), value,
+             battery_ok > 0 ? "OK" : "LOW",
+             knx_len >= 22 ? knx[20] : 0, knx_len >= 22 ? knx[21] : 0);
+    if (matched->setpoint && !std::isnan(value))
+      matched->setpoint->publish_state(value);
+  } else if (datapoint == 3) {
+    uint8_t status_val = (knx_len >= 21) ? knx[20] : 0;
+    ESP_LOGI(TAG, "[%s] status=0x%02X  battery=%s",
+             matched->room_name.c_str(), status_val,
+             battery_ok > 0 ? "OK" : "LOW");
+  } else {
+    ESP_LOGI(TAG, "[%s] unknown dp=%d  battery=%s",
+             matched->room_name.c_str(), datapoint,
+             battery_ok > 0 ? "OK" : "LOW");
   }
-
-  ESP_LOGI(TAG, "[%s] temp=%.2f°C  setpoint=%.2f°C  battery=%s",
-           matched->room_name.c_str(),
-           temperature, setpoint,
-           battery_ok > 0 ? "OK" : "LOW");
-
-  if (matched->temperature && !std::isnan(temperature))
-    matched->temperature->publish_state(temperature);
-
-  if (matched->setpoint && !std::isnan(setpoint))
-    matched->setpoint->publish_state(setpoint);
 
   if (matched->battery)
     matched->battery->publish_state(battery_ok);

@@ -29,21 +29,30 @@ static const char *const TAG = "uponor_knx_rf";
 //  0     L-field     Telegram length (everything after this byte)
 //  1     0x44        Fixed control byte for KNX RF 1.1 Fast Ack
 //  2     0xFF        Fixed byte
-//  3     RF-Info     Bit 6 (0-indexed) = battery state (1=OK, 0=Low)
+//  3     RF-Info     Bit 1 (mask 0x02) = battery state (1=OK, 0=Low)
+//                    Bit 0 (mask 0x01) = unidirectional device flag
 //  4..9  Serial      6-byte thermostat individual address (the "MAC")
 //                    T-45: starts with 00 74 6x xx xx xx
 //                    T-55: starts with 00 74 4x xx xx xx
 //                    T-75: starts with 00 74 0x xx xx xx
-//  10    Filler      0x60
-//  11    CRC-hi      First block CRC (12-byte block: bytes 0..9 + 2 CRC)
-//  12    CRC-lo
-//  13..  Data block  Application data (18-byte blocks, each ending with 2 CRC bytes)
+//  10..11  CRC-hi/lo   Block 1 CRC (CRC-16/EN-13757, poly 0x3D65, bytes 0..9)
+//  12..    Data block  Application data (up to 16 data + 2 CRC = 18 bytes)
 //
-// Within the second block, temperature data:
-//  +0..+1  address info
-//  +2..+3  address info
-//  ...
-//  Actual temp and setpoint positions depend on the KNX group addresses
+//  Block 2 layout (bytes 12..29 for L=0x13):
+//    12..13  Source address
+//    14..15  Destination address high
+//    16      Destination address low → datapoint type:
+//              0x01 = current temperature
+//              0x02 = setpoint temperature
+//              0x03 = status/mode
+//    17      ?
+//    18      APCI / data type indicator
+//    19      Padding/reserved (0x80)
+//    20..21  Data value (DPT 9.001 for dp 1 & 2)
+//    22..23  Block 2 CRC
+//
+// Temperature and setpoint are sent as SEPARATE telegrams, each with
+// 2-byte DPT 9.001 data at offset 20-21 in the KNX frame.
 //
 // DPT 9.001 encoding: value = 0.01 * M * 2^E
 //   Bits 15:    sign of mantissa
