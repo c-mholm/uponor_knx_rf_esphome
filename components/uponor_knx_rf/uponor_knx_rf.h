@@ -55,11 +55,9 @@ static const char *const TAG = "uponor_knx_rf";
 static const uint8_t RAW_BUF_LEN    = 128;
 // Decoded buffer size
 static const uint8_t DECODED_BUF_LEN = 64;
-// Minimum raw bytes to be a valid KNX RF packet
-static const uint8_t RAW_MIN_LEN    = 68;
-// Offset into decoded buffer where KNX frame starts (after preamble)
-static const uint8_t KNX_OFFSET     = 32;
-// Byte offsets within the KNX frame (relative to KNX_OFFSET)
+// Minimum raw bytes for any useful packet (even short ones get logged for debugging)
+static const uint8_t RAW_MIN_LEN    = 10;
+// Byte offsets within the KNX frame (relative to frame start)
 static const uint8_t SERIAL_OFFSET  = 4;
 // Invalid DPT 9.001 marker
 static const uint16_t DPT9_INVALID  = 0x7FFF;

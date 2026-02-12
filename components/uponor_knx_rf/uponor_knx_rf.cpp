@@ -194,7 +194,7 @@ uint8_t UponorKnxRf::manchester_decode_(const uint8_t *raw, int raw_len, uint8_t
 
 // ---------------------------------------------------------------------------
 // receive_and_process_()
-// Full pipeline: raw CC1101 → Manchester decode → KNX frame validation →
+// Full pipeline: raw CC1101 → log → Manchester decode → find KNX header →
 // serial extraction → temperature decode → publish to HA
 // ---------------------------------------------------------------------------
 void UponorKnxRf::receive_and_process_() {
@@ -205,52 +205,80 @@ void UponorKnxRf::receive_and_process_() {
 
   ELECHOUSE_cc1101.SetRx();  // Re-arm receiver immediately
 
-  if (raw_len < RAW_MIN_LEN) {
-    ESP_LOGD(TAG, "Ignored short packet (%d raw bytes, need >= %d)", raw_len, RAW_MIN_LEN);
+  if (raw_len < RAW_MIN_LEN || raw_len > RAW_BUF_LEN) {
+    ESP_LOGD(TAG, "Ignored packet (%d raw bytes)", raw_len);
     return;
   }
 
-  // Log raw hex at VERBOSE level
-  if (ESPHOME_LOG_LEVEL >= ESPHOME_LOG_LEVEL_VERBOSE) {
+  // Always log raw hex at DEBUG level for diagnostics
+  {
     char hex[RAW_BUF_LEN * 3 + 4];
     int pos = 0;
     for (int i = 0; i < raw_len && pos < (int)sizeof(hex) - 4; i++) {
       pos += snprintf(hex + pos, sizeof(hex) - pos, "%02X ", raw_buf[i]);
     }
-    ESP_LOGV(TAG, "RAW RX [%d bytes]: %s", raw_len, hex);
+    ESP_LOGD(TAG, "RAW [%d]: %s", raw_len, hex);
   }
-
-  // Note: KNX RF uses its own block-based CRC-16, not standard CC1101 CRC.
-  // We skip hardware CRC checking and validate at the application layer.
 
   // Manchester decode: 2 raw bytes → 1 decoded byte
   uint8_t decoded[DECODED_BUF_LEN];
   memset(decoded, 0, sizeof(decoded));
   uint8_t decoded_len = manchester_decode_(raw_buf, raw_len, decoded);
 
-  // Log decoded hex at DEBUG level
-  if (ESPHOME_LOG_LEVEL >= ESPHOME_LOG_LEVEL_DEBUG) {
+  // Log Manchester-decoded hex
+  {
     char hex[DECODED_BUF_LEN * 3 + 4];
     int pos = 0;
     for (int i = 0; i < decoded_len && pos < (int)sizeof(hex) - 4; i++) {
       pos += snprintf(hex + pos, sizeof(hex) - pos, "%02X ", decoded[i]);
     }
-    ESP_LOGD(TAG, "Decoded [%d bytes]: %s", decoded_len, hex);
+    ESP_LOGD(TAG, "MAN [%d]: %s", decoded_len, hex);
   }
 
-  // KNX frame starts at KNX_OFFSET in the decoded buffer
-  if (decoded_len < KNX_OFFSET + 10) {
-    ESP_LOGD(TAG, "Decoded packet too short (%d bytes, need >= %d)", decoded_len, KNX_OFFSET + 10);
+  // Also log the raw buffer AS-IS (without Manchester decode) to see if
+  // the KNX frame is already decoded by CC1101
+  // Check: does the raw buffer contain 0x44 0xFF at any reasonable position?
+  int raw_knx_offset = -1;
+  for (int i = 0; i + 10 < raw_len; i++) {
+    if (raw_buf[i] == 0x44 && raw_buf[i + 1] == 0xFF) {
+      raw_knx_offset = i - 1;  // -1 because byte before 0x44 is L-field
+      break;
+    }
+  }
+
+  // Search Manchester-decoded buffer for KNX header (0x44 0xFF)
+  int man_knx_offset = -1;
+  for (int i = 0; i + 10 < decoded_len; i++) {
+    if (decoded[i] == 0x44 && decoded[i + 1] == 0xFF) {
+      man_knx_offset = i - 1;  // -1 for L-field
+      break;
+    }
+  }
+
+  ESP_LOGD(TAG, "KNX header search: raw_offset=%d  manchester_offset=%d", raw_knx_offset, man_knx_offset);
+
+  // Determine which buffer and offset to use
+  const uint8_t *knx = nullptr;
+  uint8_t knx_len = 0;
+  bool used_manchester = false;
+
+  if (man_knx_offset >= 0 && man_knx_offset + 10 < decoded_len) {
+    knx = &decoded[man_knx_offset];
+    knx_len = decoded_len - man_knx_offset;
+    used_manchester = true;
+  } else if (raw_knx_offset >= 0 && raw_knx_offset + 10 < raw_len) {
+    // KNX frame found directly in raw buffer (no Manchester decode needed)
+    knx = &raw_buf[raw_knx_offset];
+    knx_len = raw_len - raw_knx_offset;
+    used_manchester = false;
+  } else {
+    ESP_LOGD(TAG, "No KNX RF header (0x44 0xFF) found in packet");
     return;
   }
 
-  // Pointer to KNX frame
-  const uint8_t *knx = &decoded[KNX_OFFSET];
-  uint8_t knx_len = decoded_len - KNX_OFFSET;
-
-  // Validate KNX RF 1.1 header bytes
+  // Validate header
   if (knx[1] != 0x44 || knx[2] != 0xFF) {
-    ESP_LOGD(TAG, "Not a KNX RF 1.1 frame (byte[1]=0x%02X, byte[2]=0x%02X)", knx[1], knx[2]);
+    ESP_LOGD(TAG, "KNX header validation failed");
     return;
   }
 
@@ -258,10 +286,16 @@ void UponorKnxRf::receive_and_process_() {
 
   // Extract 6-byte serial (bytes 4..9 of KNX frame)
   std::string serial = extract_serial_(knx);
-  ESP_LOGD(TAG, "Packet serial: %s", serial.c_str());
 
   // Battery: RF-Info byte 3, bit 6 (1=OK, 0=low)
   float battery_ok = (knx[3] & 0x40) ? 1.0f : 0.0f;
+
+  ESP_LOGI(TAG, "KNX packet: serial=%s battery=%s via=%s offset=%d len=%d",
+           serial.c_str(),
+           battery_ok > 0 ? "OK" : "LOW",
+           used_manchester ? "manchester" : "raw",
+           used_manchester ? man_knx_offset : raw_knx_offset,
+           knx_len);
 
   // Find matching thermostat
   ThermostatEntry *matched = nullptr;
@@ -274,47 +308,47 @@ void UponorKnxRf::receive_and_process_() {
 
   if (!matched) {
     unknown_serial_count_++;
-    ESP_LOGI(TAG, "Unknown serial %s – if this is your thermostat, add it to the YAML", serial.c_str());
+    ESP_LOGI(TAG, "Unknown serial %s – add it to the YAML thermostats list", serial.c_str());
     return;
   }
 
-  // Extract temperature data from the second KNX block
-  // First block is 12 bytes (10 data + 2 CRC), starts at knx[0]
-  // Second block starts at knx[12] (after first block CRC)
-  // In the second block, temperature data location depends on the
-  // KNX group addresses. For Uponor T-45 thermostats, the reference
-  // implementation reads temperature at offsets 20 and 21 from KNX start.
-  // That maps to: knx[20] and knx[21] for current temp.
-  //
-  // We try multiple known temperature positions to be robust:
-  // - Position 20,21 = current temperature (from reference impl)
-  // - Position 22,23 = setpoint temperature (from reference impl)
+  // Log full KNX frame for debugging temperature offsets
+  {
+    char hex[DECODED_BUF_LEN * 3 + 4];
+    int pos = 0;
+    for (int i = 0; i < knx_len && i < 40 && pos < (int)sizeof(hex) - 4; i++) {
+      pos += snprintf(hex + pos, sizeof(hex) - pos, "%02X ", knx[i]);
+    }
+    ESP_LOGD(TAG, "[%s] KNX frame [%d]: %s", matched->room_name.c_str(), knx_len, hex);
+  }
+
+  // Extract temperature data
+  // Reference implementation uses offsets 20,21 for temp and 22,23 for setpoint
+  // relative to the KNX frame start. These offsets span across block boundaries
+  // (first block = 10 data + 2 CRC = 12 bytes, second block = 16 data + 2 CRC = 18 bytes).
   float temperature = NAN;
   float setpoint = NAN;
 
-  if (knx_len >= 24) {
-    // Current temperature at offset 20-21
+  if (knx_len >= 22) {
     uint16_t raw_temp = ((uint16_t)knx[20] << 8) | knx[21];
     if (raw_temp != DPT9_INVALID && raw_temp != 0x0000) {
       temperature = (float)transform_temperature_(raw_temp) / 100.0f;
     }
-
-    // Setpoint at offset 22-23
-    if (knx_len >= 26) {
-      uint16_t raw_setp = ((uint16_t)knx[22] << 8) | knx[23];
-      if (raw_setp != DPT9_INVALID && raw_setp != 0x0000) {
-        setpoint = (float)transform_temperature_(raw_setp) / 100.0f;
-      }
+  }
+  if (knx_len >= 24) {
+    uint16_t raw_setp = ((uint16_t)knx[22] << 8) | knx[23];
+    if (raw_setp != DPT9_INVALID && raw_setp != 0x0000) {
+      setpoint = (float)transform_temperature_(raw_setp) / 100.0f;
     }
   }
 
   // Sanity bounds
   if (!std::isnan(temperature) && (temperature < -20.0f || temperature > 60.0f)) {
-    ESP_LOGW(TAG, "[%s] Temperature %.2f out of range, discarding", matched->room_name.c_str(), temperature);
+    ESP_LOGW(TAG, "[%s] Temperature %.2f out of range", matched->room_name.c_str(), temperature);
     temperature = NAN;
   }
   if (!std::isnan(setpoint) && (setpoint < 0.0f || setpoint > 45.0f)) {
-    ESP_LOGW(TAG, "[%s] Setpoint %.2f out of range, discarding", matched->room_name.c_str(), setpoint);
+    ESP_LOGW(TAG, "[%s] Setpoint %.2f out of range", matched->room_name.c_str(), setpoint);
     setpoint = NAN;
   }
 
