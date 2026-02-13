@@ -126,7 +126,6 @@ class UponorKnxRf : public Component {
   bool first_loop_{true};
   uint32_t packet_count_{0};
   uint32_t unknown_serial_count_{0};
-  uint32_t noise_count_{0};
   uint32_t last_status_log_{0};
 };
 
