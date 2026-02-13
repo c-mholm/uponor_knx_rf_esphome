@@ -143,8 +143,8 @@ void UponorKnxRf::loop() {
     last_status_log_ = now;
     byte rxbytes = ELECHOUSE_cc1101.SpiReadStatus(0x3B);  // CC1101_RXBYTES
     byte marcstate = ELECHOUSE_cc1101.SpiReadStatus(0x35); // CC1101_MARCSTATE
-    ESP_LOGI(TAG, "Status: %u packets received, %u unknown serials | RXBYTES=%d MARCSTATE=0x%02X",
-             packet_count_, unknown_serial_count_, rxbytes, marcstate);
+    ESP_LOGI(TAG, "Status: %u KNX packets, %u unknown serials, %u noise | RXBYTES=%d MARCSTATE=0x%02X",
+             packet_count_, unknown_serial_count_, noise_count_, rxbytes, marcstate);
     // MARCSTATE: 0x0D = RX (good), 0x01 = IDLE, 0x11 = RX_OVERFLOW
     if ((marcstate & 0x1F) != 0x0D) {
       ESP_LOGW(TAG, "CC1101 not in RX state (0x%02X) – re-arming", marcstate);
@@ -152,19 +152,17 @@ void UponorKnxRf::loop() {
     }
   }
 
-  // Check if there are bytes in the RX FIFO (direct register read, not library call)
+  // In fixed-length mode (PKTLEN=61), the CC1101 fills the FIFO with exactly
+  // 61 bytes before asserting GDO0 / making them available. No delay needed —
+  // if RXBYTES >= PKTLEN the packet is already complete.
   byte rxbytes_now = ELECHOUSE_cc1101.SpiReadStatus(0x3B) & 0x7F;
-  if (rxbytes_now > 0) {
-    // Wait for the full packet to arrive. At 32.73 kBaud, 61 bytes takes ~15ms.
-    // Wait up to 25ms, checking every 5ms for no new bytes (end of packet).
-    byte prev = rxbytes_now;
-    for (int wait = 0; wait < 5; wait++) {
-      delay(5);
-      byte cur = ELECHOUSE_cc1101.SpiReadStatus(0x3B) & 0x7F;
-      if (cur == prev) break;  // No new bytes → packet complete
-      prev = cur;
-    }
+  if (rxbytes_now >= 61) {
     receive_and_process_();
+  } else if (rxbytes_now > 0) {
+    // Partial data in FIFO — likely an RX overflow or truncated packet.
+    // Flush and re-arm rather than waiting (which would block the ESPHome loop).
+    ELECHOUSE_cc1101.SpiStrobe(0x3A);  // SFRX
+    ELECHOUSE_cc1101.SetRx();
   }
 }
 
@@ -203,8 +201,10 @@ uint8_t UponorKnxRf::manchester_decode_(const uint8_t *raw, int raw_len, uint8_t
 
 // ---------------------------------------------------------------------------
 // receive_and_process_()
-// Full pipeline: raw CC1101 → log → Manchester decode → find KNX header →
-// serial extraction → temperature decode → publish to HA
+// Full pipeline: read CC1101 FIFO → early noise reject (decode 2 bytes) →
+// full Manchester decode → validate KNX header → extract serial/temp →
+// publish to HA.  Noise packets are rejected before the expensive full
+// decode and hex-formatting steps.
 // ---------------------------------------------------------------------------
 void UponorKnxRf::receive_and_process_() {
   uint8_t raw_buf[RAW_BUF_LEN];
@@ -222,81 +222,49 @@ void UponorKnxRf::receive_and_process_() {
   ELECHOUSE_cc1101.SetRx();          // Re-arm receiver
 
   if (raw_len < RAW_MIN_LEN || raw_len > RAW_BUF_LEN) {
-    ESP_LOGD(TAG, "Ignored packet (%d raw bytes)", raw_len);
-    return;
+    return;  // Too short or too long — discard silently
   }
 
-  // Always log raw hex at DEBUG level for diagnostics
-  {
-    char hex[RAW_BUF_LEN * 3 + 4];
-    int pos = 0;
-    for (int i = 0; i < raw_len && pos < (int)sizeof(hex) - 4; i++) {
-      pos += snprintf(hex + pos, sizeof(hex) - pos, "%02X ", raw_buf[i]);
+  // --- Early noise rejection ---
+  // Manchester-decode only the first 4 bytes (raw bytes 0–7) and check for
+  // the KNX header (0x44 at decoded[1], 0xFF at decoded[2]).
+  // This rejects ~50% of packets that are just RF noise, WITHOUT doing the
+  // expensive full decode, hex formatting, or search loops.
+  // Valid KNX packets always have 0x44 0xFF at decoded offset 1–2 because
+  // the CC1101 sync word aligns the frame start to raw byte 0.
+  if (raw_len >= 8) {
+    uint8_t d1 = mandecode_byte_(raw_buf[2], raw_buf[3]);  // decoded[1]
+    uint8_t d2 = mandecode_byte_(raw_buf[4], raw_buf[5]);  // decoded[2]
+    if (d1 != 0x44 || d2 != 0xFF) {
+      noise_count_++;
+      return;  // Not a KNX packet — discard silently
     }
-    ESP_LOGD(TAG, "RAW [%d]: %s", raw_len, hex);
   }
 
-  // Manchester decode: 2 raw bytes → 1 decoded byte
+  // Full Manchester decode (only reached for likely-valid KNX packets)
   uint8_t decoded[DECODED_BUF_LEN];
   memset(decoded, 0, sizeof(decoded));
   uint8_t decoded_len = manchester_decode_(raw_buf, raw_len, decoded);
 
-  // Log Manchester-decoded hex
+  // Log decoded hex at DEBUG level
   {
     char hex[DECODED_BUF_LEN * 3 + 4];
     int pos = 0;
     for (int i = 0; i < decoded_len && pos < (int)sizeof(hex) - 4; i++) {
       pos += snprintf(hex + pos, sizeof(hex) - pos, "%02X ", decoded[i]);
     }
-    ESP_LOGD(TAG, "MAN [%d]: %s", decoded_len, hex);
+    ESP_LOGD(TAG, "KNX [%d]: %s", decoded_len, hex);
   }
 
-  // Also log the raw buffer AS-IS (without Manchester decode) to see if
-  // the KNX frame is already decoded by CC1101
-  // Check: does the raw buffer contain 0x44 0xFF at any reasonable position?
-  int raw_knx_offset = -1;
-  for (int i = 0; i + 10 < raw_len; i++) {
-    if (raw_buf[i] == 0x44 && raw_buf[i + 1] == 0xFF) {
-      raw_knx_offset = i - 1;  // -1 because byte before 0x44 is L-field
-      break;
-    }
-  }
-
-  // Search Manchester-decoded buffer for KNX header (0x44 0xFF)
-  int man_knx_offset = -1;
-  for (int i = 0; i + 10 < decoded_len; i++) {
-    if (decoded[i] == 0x44 && decoded[i + 1] == 0xFF) {
-      man_knx_offset = i - 1;  // -1 for L-field
-      break;
-    }
-  }
-
-  ESP_LOGD(TAG, "KNX header search: raw_offset=%d  manchester_offset=%d", raw_knx_offset, man_knx_offset);
-
-  // Determine which buffer and offset to use
-  const uint8_t *knx = nullptr;
-  uint8_t knx_len = 0;
-  bool used_manchester = false;
-
-  if (man_knx_offset >= 0 && man_knx_offset + 10 < decoded_len) {
-    knx = &decoded[man_knx_offset];
-    knx_len = decoded_len - man_knx_offset;
-    used_manchester = true;
-  } else if (raw_knx_offset >= 0 && raw_knx_offset + 10 < raw_len) {
-    // KNX frame found directly in raw buffer (no Manchester decode needed)
-    knx = &raw_buf[raw_knx_offset];
-    knx_len = raw_len - raw_knx_offset;
-    used_manchester = false;
-  } else {
-    ESP_LOGD(TAG, "No KNX RF header (0x44 0xFF) found in packet");
+  // KNX frame always starts at offset 0 in the Manchester-decoded buffer
+  // (sync word alignment guarantees this).
+  if (decoded_len < 22 || decoded[1] != 0x44 || decoded[2] != 0xFF) {
+    ESP_LOGD(TAG, "KNX header validation failed after full decode");
     return;
   }
 
-  // Validate header
-  if (knx[1] != 0x44 || knx[2] != 0xFF) {
-    ESP_LOGD(TAG, "KNX header validation failed");
-    return;
-  }
+  const uint8_t *knx = decoded;
+  uint8_t knx_len = decoded_len;
 
   packet_count_++;
 
@@ -316,12 +284,10 @@ void UponorKnxRf::receive_and_process_() {
   // Bytes 22-23 are the Block 2 CRC, NOT a second data value!
   uint8_t datapoint = (knx_len > 16) ? knx[16] : 0;
 
-  ESP_LOGI(TAG, "KNX packet: serial=%s battery=%s dp=%d via=%s offset=%d len=%d",
+  ESP_LOGI(TAG, "KNX packet: serial=%s battery=%s dp=%d len=%d",
            serial.c_str(),
            battery_ok > 0 ? "OK" : "LOW",
            datapoint,
-           used_manchester ? "manchester" : "raw",
-           used_manchester ? man_knx_offset : raw_knx_offset,
            knx_len);
 
   // Find matching thermostat
