@@ -96,6 +96,12 @@ async def to_code(config):
     var = cg.new_Pvariable(config[CONF_ID])
     await cg.register_component(var, config)
 
+    # Arduino SPI library — must be declared explicitly so PlatformIO adds its
+    # include path (frameworks-arduinoespressif32/libraries/SPI/src/) to the
+    # compiler search path.  Without this, the vendored ELECHOUSE_CC1101_SRC_DRV.cpp
+    # cannot find <SPI.h> when building with ESPHome 2026.2+ / pioarduino.
+    cg.add_library("SPI", None)
+
     cg.add(var.set_gdo0_pin(config[CONF_GDO0_PIN]))
     cg.add(var.set_cs_pin(config[CONF_CS_PIN]))
     cg.add(var.set_mosi_pin(config[CONF_MOSI_PIN]))
