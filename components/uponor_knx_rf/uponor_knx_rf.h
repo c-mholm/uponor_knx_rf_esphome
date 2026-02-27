@@ -4,7 +4,7 @@
 #include "esphome/core/log.h"
 #include "esphome/components/sensor/sensor.h"
 #include "Crc16.h"
-#include <ELECHOUSE_CC1101_SRC_DRV.h>
+#include "ELECHOUSE_CC1101_SRC_DRV.h"
 #include <vector>
 #include <string>
 #include <cmath>

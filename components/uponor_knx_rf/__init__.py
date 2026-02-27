@@ -102,9 +102,6 @@ async def to_code(config):
     cg.add(var.set_miso_pin(config[CONF_MISO_PIN]))
     cg.add(var.set_sck_pin(config[CONF_SCK_PIN]))
 
-    # Pull in the CC1101 driver library via PlatformIO
-    cg.add_library("LSatan/SmartRC-CC1101-Driver-Lib", None)
-
     for ts in config[CONF_THERMOSTATS]:
         serial = ts[CONF_SERIAL]
         name   = ts[CONF_NAME]
