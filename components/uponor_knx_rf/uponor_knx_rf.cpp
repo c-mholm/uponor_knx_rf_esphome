@@ -1,6 +1,6 @@
 #include "uponor_knx_rf.h"
 #include "esphome/core/log.h"
-#include <ELECHOUSE_CC1101_SRC_DRV.h>
+#include "ELECHOUSE_CC1101_SRC_DRV.h"
 #include <cstring>
 #include <cctype>
 #include <cstdio>
