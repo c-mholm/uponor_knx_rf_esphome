@@ -335,6 +335,7 @@ void UponorKnxRf::receive_and_process_() {
     uint16_t calc = knx_crc16(knx, 10);
     uint16_t pkt  = ((uint16_t)knx[10] << 8) | knx[11];
     blk1_crc_ok   = (calc == pkt);
+    ESP_LOGD(TAG, "CRC debug: calc=0x%04X pkt=0x%04X %s", calc, pkt, blk1_crc_ok ? "OK" : "FAIL");
   }
 
   packet_count_++;
