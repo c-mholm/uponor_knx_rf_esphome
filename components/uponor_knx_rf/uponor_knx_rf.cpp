@@ -217,8 +217,11 @@ void UponorKnxRf::receive_and_process_() {
   if (raw_len > 0) {
     ELECHOUSE_cc1101.SpiReadBurstReg(0x3F, raw_buf, raw_len);  // 0x3F = CC1101_RXFIFO
   }
-  // Read RSSI before flushing — RSSI register stays valid until next reception
+  // Read RSSI and FREQEST before flushing — registers stay valid until next reception.
+  // FREQEST (0x32): signed 8-bit AFC frequency offset estimate, units ~99 Hz/step.
+  // Consistent non-zero values for a specific thermostat indicate crystal frequency offset.
   int rssi_dbm = ELECHOUSE_cc1101.getRssi();
+  int8_t freqest = (int8_t)ELECHOUSE_cc1101.SpiReadStatus(0x32);
   // Flush FIFO and re-arm receiver
   ELECHOUSE_cc1101.SpiStrobe(0x3A);  // SFRX — flush RX FIFO
   ELECHOUSE_cc1101.SetRx();          // Re-arm receiver
@@ -327,15 +330,20 @@ void UponorKnxRf::receive_and_process_() {
     // man_errors keeps the inflated full-buffer value.
   }
 
-  // Block 1 CRC diagnostic (bytes 0..9, CRC stored at bytes 10-11)
-  // Algorithm: CRC-16/EN-13757 (poly=0x3D65, init=0, RefIn/RefOut=true, XorOut=0xFFFF)
-  // blk1_crc=FAIL indicates a corrupted frame; use as a soft filter once confirmed working.
+  // Block 1 CRC (bytes 0..9, CRC stored big-endian at bytes 10-11)
+  // Algorithm: CRC-16/EN-13757 (poly=0x3D65, RefIn/RefOut=false, XorOut=0xFFFF)
   bool blk1_crc_ok = false;
   if (knx_len >= 12) {
     uint16_t calc = knx_crc16(knx, 10);
     uint16_t pkt  = ((uint16_t)knx[10] << 8) | knx[11];
     blk1_crc_ok   = (calc == pkt);
-    ESP_LOGD(TAG, "CRC debug: calc=0x%04X pkt=0x%04X %s", calc, pkt, blk1_crc_ok ? "OK" : "FAIL");
+  }
+  if (!blk1_crc_ok) {
+    // Drop corrupted frames. Log at INFO so we can track interference frequency.
+    ESP_LOGI(TAG, "CRC FAIL – dropped: rssi=%d dBm freqest=%d man_err=%d serial=%s",
+             rssi_dbm, freqest, man_errors,
+             extract_serial_(knx).c_str());
+    return;
   }
 
   packet_count_++;
@@ -356,14 +364,14 @@ void UponorKnxRf::receive_and_process_() {
   // Bytes 22-23 are the Block 2 CRC, NOT a second data value!
   uint8_t datapoint = (knx_len > 16) ? knx[16] : 0;
 
-  ESP_LOGI(TAG, "KNX packet: serial=%s battery=%s dp=%d via=%s rssi=%d dBm man_err=%d blk1_crc=%s",
+  ESP_LOGI(TAG, "KNX packet: serial=%s battery=%s dp=%d via=%s rssi=%d dBm freqest=%d man_err=%d",
            serial.c_str(),
            battery_ok > 0 ? "OK" : "LOW",
            datapoint,
            used_manchester ? "manchester" : "raw",
            rssi_dbm,
-           man_errors,
-           blk1_crc_ok ? "OK" : "FAIL");
+           freqest,
+           man_errors);
 
   // Find matching thermostat
   ThermostatEntry *matched = nullptr;
