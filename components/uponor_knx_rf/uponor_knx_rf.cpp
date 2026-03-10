@@ -45,7 +45,7 @@ void UponorKnxRf::setup() {
   ELECHOUSE_cc1101.setRxBW(270.833333);
   ELECHOUSE_cc1101.setDRate(32.7301);
   ELECHOUSE_cc1101.setPA(5);
-  ELECHOUSE_cc1101.setSyncMode(2);            // 16/16 sync word match
+  ELECHOUSE_cc1101.setSyncMode(1);            // 15/16 sync word match (tolerates 1-bit sync error)
   ELECHOUSE_cc1101.setSyncWord(0x76, 0x96);   // KNX RF RX sync word
   ELECHOUSE_cc1101.setPacketLength(61);       // Max packet length
 
@@ -64,14 +64,14 @@ void UponorKnxRf::setup() {
   ELECHOUSE_cc1101.SpiWriteReg(0x0C, 0x00);  // FSCTRL0: frequency offset
   ELECHOUSE_cc1101.SpiWriteReg(0x10, 0x6A);  // MDMCFG4: RxBW=270kHz, DRate exp=0x0A
   ELECHOUSE_cc1101.SpiWriteReg(0x11, 0x4A);  // MDMCFG3: DRate mantissa → 32.73 kBaud
-  ELECHOUSE_cc1101.SpiWriteReg(0x12, 0x02);  // MDMCFG2: 2-FSK, Manchester OFF, 16/16 sync
+  ELECHOUSE_cc1101.SpiWriteReg(0x12, 0x01);  // MDMCFG2: 2-FSK, Manchester OFF, 15/16 sync (tolerates 1-bit sync error)
   ELECHOUSE_cc1101.SpiWriteReg(0x13, 0x22);  // MDMCFG1: 4 preamble bytes, chanspc exp
   ELECHOUSE_cc1101.SpiWriteReg(0x15, 0x47);  // DEVIATN: 47.6 kHz deviation
   ELECHOUSE_cc1101.SpiWriteReg(0x17, 0x30);  // MCSM1:   CCA mode, after RX/TX state
   ELECHOUSE_cc1101.SpiWriteReg(0x18, 0x18);  // MCSM0:   auto-cal IDLE→RX/TX
   ELECHOUSE_cc1101.SpiWriteReg(0x19, 0x2E);  // FOCCFG:  frequency offset compensation
   ELECHOUSE_cc1101.SpiWriteReg(0x1A, 0x6D);  // BSCFG:   bit synchronization
-  ELECHOUSE_cc1101.SpiWriteReg(0x1B, 0x43);  // AGCCTRL2: AGC target 33 dB
+  ELECHOUSE_cc1101.SpiWriteReg(0x1B, 0x07);  // AGCCTRL2: all DVGA gains allowed, 42 dB target (max sensitivity)
   ELECHOUSE_cc1101.SpiWriteReg(0x1C, 0x40);  // AGCCTRL1: LNA priority
   ELECHOUSE_cc1101.SpiWriteReg(0x1D, 0x91);  // AGCCTRL0: filter samples = 16
   ELECHOUSE_cc1101.SpiWriteReg(0x20, 0xFB);  // WORCTRL: WOR control
@@ -174,7 +174,7 @@ void UponorKnxRf::loop() {
 // Each pair of bits: 01 = 1, 10 = 0
 // Returns the decoded byte.
 // ---------------------------------------------------------------------------
-uint8_t UponorKnxRf::mandecode_byte_(uint8_t hi, uint8_t lo) {
+uint8_t UponorKnxRf::mandecode_byte_(uint8_t hi, uint8_t lo, uint8_t &errors) {
   unsigned int combined = ((unsigned int)hi << 8) | lo;
   uint8_t ret = 0;
   for (int i = 0; i < 8; i++) {
@@ -182,7 +182,7 @@ uint8_t UponorKnxRf::mandecode_byte_(uint8_t hi, uint8_t lo) {
     switch (b2) {
       case 0x01: ret = (ret << 1) | 1; break;  // 01 = 1
       case 0x02: ret = (ret << 1) | 0; break;  // 10 = 0
-      default:   ret = (ret << 1) | 0; break;  // Manchester error, treat as 0
+      default:   errors++; ret = (ret << 1) | 0; break;  // Manchester violation (00 or 11)
     }
   }
   return ret;
@@ -193,10 +193,10 @@ uint8_t UponorKnxRf::mandecode_byte_(uint8_t hi, uint8_t lo) {
 // Decode raw CC1101 buffer (Manchester encoded at 2x rate) into actual bytes.
 // Returns number of decoded bytes written to 'decoded'.
 // ---------------------------------------------------------------------------
-uint8_t UponorKnxRf::manchester_decode_(const uint8_t *raw, int raw_len, uint8_t *decoded) {
+uint8_t UponorKnxRf::manchester_decode_(const uint8_t *raw, int raw_len, uint8_t *decoded, uint8_t &errors) {
   uint8_t out_idx = 0;
   for (int i = 0; i + 1 < raw_len && out_idx < DECODED_BUF_LEN; i += 2) {
-    decoded[out_idx++] = mandecode_byte_(raw[i], raw[i + 1]);
+    decoded[out_idx++] = mandecode_byte_(raw[i], raw[i + 1], errors);
   }
   return out_idx;
 }
@@ -217,6 +217,8 @@ void UponorKnxRf::receive_and_process_() {
   if (raw_len > 0) {
     ELECHOUSE_cc1101.SpiReadBurstReg(0x3F, raw_buf, raw_len);  // 0x3F = CC1101_RXFIFO
   }
+  // Read RSSI before flushing — RSSI register stays valid until next reception
+  int rssi_dbm = ELECHOUSE_cc1101.getRssi();
   // Flush FIFO and re-arm receiver
   ELECHOUSE_cc1101.SpiStrobe(0x3A);  // SFRX — flush RX FIFO
   ELECHOUSE_cc1101.SetRx();          // Re-arm receiver
@@ -239,7 +241,8 @@ void UponorKnxRf::receive_and_process_() {
   // Manchester decode: 2 raw bytes → 1 decoded byte
   uint8_t decoded[DECODED_BUF_LEN];
   memset(decoded, 0, sizeof(decoded));
-  uint8_t decoded_len = manchester_decode_(raw_buf, raw_len, decoded);
+  uint8_t man_errors = 0;
+  uint8_t decoded_len = manchester_decode_(raw_buf, raw_len, decoded, man_errors);
 
   // Log Manchester-decoded hex
   {
@@ -298,6 +301,16 @@ void UponorKnxRf::receive_and_process_() {
     return;
   }
 
+  // Block 1 CRC diagnostic (bytes 0..9, CRC stored at bytes 10-11)
+  // NOTE: Crc16.h uses CRC-16/CCITT-FALSE (poly 0x1021); KNX RF 1.1 uses EN-13757 (poly 0x3D65).
+  // This is diagnostic-only — do not filter on it until the correct polynomial is confirmed.
+  bool blk1_crc_ok = false;
+  if (knx_len >= 12) {
+    uint16_t calc = knx_crc16(knx, 10);
+    uint16_t pkt  = ((uint16_t)knx[10] << 8) | knx[11];
+    blk1_crc_ok   = (calc == pkt);
+  }
+
   packet_count_++;
 
   // Extract 6-byte serial (bytes 4..9 of KNX frame)
@@ -316,13 +329,14 @@ void UponorKnxRf::receive_and_process_() {
   // Bytes 22-23 are the Block 2 CRC, NOT a second data value!
   uint8_t datapoint = (knx_len > 16) ? knx[16] : 0;
 
-  ESP_LOGI(TAG, "KNX packet: serial=%s battery=%s dp=%d via=%s offset=%d len=%d",
+  ESP_LOGI(TAG, "KNX packet: serial=%s battery=%s dp=%d via=%s rssi=%d dBm man_err=%d blk1_crc=%s",
            serial.c_str(),
            battery_ok > 0 ? "OK" : "LOW",
            datapoint,
            used_manchester ? "manchester" : "raw",
-           used_manchester ? man_knx_offset : raw_knx_offset,
-           knx_len);
+           rssi_dbm,
+           man_errors,
+           blk1_crc_ok ? "OK" : "FAIL");
 
   // Find matching thermostat
   ThermostatEntry *matched = nullptr;
@@ -335,7 +349,7 @@ void UponorKnxRf::receive_and_process_() {
 
   if (!matched) {
     unknown_serial_count_++;
-    ESP_LOGI(TAG, "Unknown serial %s – add it to the YAML thermostats list", serial.c_str());
+    ESP_LOGI(TAG, "Unknown serial %s – rssi=%d dBm man_err=%d – add it to YAML", serial.c_str(), rssi_dbm, man_errors);
     return;
   }
 

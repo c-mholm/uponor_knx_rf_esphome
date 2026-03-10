@@ -108,8 +108,8 @@ class UponorKnxRf : public Component {
 
  protected:
   void        receive_and_process_();
-  uint8_t     manchester_decode_(const uint8_t *raw, int raw_len, uint8_t *decoded);
-  uint8_t     mandecode_byte_(uint8_t hi, uint8_t lo);
+  uint8_t     manchester_decode_(const uint8_t *raw, int raw_len, uint8_t *decoded, uint8_t &errors);
+  uint8_t     mandecode_byte_(uint8_t hi, uint8_t lo, uint8_t &errors);
   std::string extract_serial_(const uint8_t *knx_frame);
   float       decode_dpt9_(uint8_t hi, uint8_t lo);
   uint16_t    transform_temperature_(uint16_t data);
