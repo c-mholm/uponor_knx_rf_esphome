@@ -298,7 +298,23 @@ void UponorKnxRf::receive_and_process_() {
     // failed to decode (e.g. Filip's transmissions entering the FIFO but decoding wrong).
     // Weak packets (< -85 dBm) are background noise → stay at DEBUG to reduce log spam.
     if (rssi_dbm > -85) {
-      ESP_LOGI(TAG, "No KNX header – rssi=%d dBm man_err=%d (strong packet, failed decode)", rssi_dbm, man_errors);
+      ESP_LOGI(TAG, "No KNX header – rssi=%d dBm freqest=%d man_err=%d (strong packet, failed decode)",
+               rssi_dbm, freqest, man_errors);
+      // Dump raw and Manchester-decoded bytes at INFO to help identify the interferer's protocol.
+      {
+        char hex[RAW_BUF_LEN * 3 + 4];
+        int pos = 0;
+        for (int i = 0; i < raw_len && pos < (int)sizeof(hex) - 4; i++)
+          pos += snprintf(hex + pos, sizeof(hex) - pos, "%02X ", raw_buf[i]);
+        ESP_LOGI(TAG, "  RAW [%d]: %s", raw_len, hex);
+      }
+      {
+        char hex[DECODED_BUF_LEN * 3 + 4];
+        int pos = 0;
+        for (int i = 0; i < decoded_len && pos < (int)sizeof(hex) - 4; i++)
+          pos += snprintf(hex + pos, sizeof(hex) - pos, "%02X ", decoded[i]);
+        ESP_LOGI(TAG, "  MAN [%d]: %s", decoded_len, hex);
+      }
     } else {
       ESP_LOGD(TAG, "No KNX header – rssi=%d dBm man_err=%d (noise)", rssi_dbm, man_errors);
     }
