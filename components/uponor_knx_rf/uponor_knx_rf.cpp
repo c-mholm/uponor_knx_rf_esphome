@@ -152,19 +152,28 @@ void UponorKnxRf::loop() {
     }
   }
 
-  // Check if there are bytes in the RX FIFO (direct register read, not library call)
+  // Fixed-length mode (PKTCTRL0=0x00, PKTLEN=61): after the sync word the CC1101
+  // counts exactly 61 raw bytes into the FIFO and stops.  No delay() is needed —
+  // just check whether RXBYTES has reached 61 yet.
+  //
+  // RXBYTES < 61 → packet still arriving; return immediately so ESPHome can do
+  //               WiFi/API work, then come back on the next loop() call (~1-5 ms).
+  // RXBYTES == 61 → packet complete; read it right now with zero additional wait.
+  // RXBYTES >  61 → should not happen in fixed-length mode; defensively flush.
+  //
+  // This replaces the old delay(5)×5 blocking approach (5-25 ms) that caused the
+  // ESPHome ">30 ms loop" warning and prevented WiFi processing during reception.
+  // At 32.73 kBaud, a 61-byte packet takes ~14.9 ms; ESPHome's loop() interval
+  // (1-5 ms) is short enough that RXBYTES==61 is detected within one extra call.
   byte rxbytes_now = ELECHOUSE_cc1101.SpiReadStatus(0x3B) & 0x7F;
-  if (rxbytes_now > 0) {
-    // Wait for the full packet to arrive. At 32.73 kBaud, 61 bytes takes ~15ms.
-    // Wait up to 25ms, checking every 5ms for no new bytes (end of packet).
-    byte prev = rxbytes_now;
-    for (int wait = 0; wait < 5; wait++) {
-      delay(5);
-      byte cur = ELECHOUSE_cc1101.SpiReadStatus(0x3B) & 0x7F;
-      if (cur == prev) break;  // No new bytes → packet complete
-      prev = cur;
-    }
+  if (rxbytes_now == 61) {
     receive_and_process_();
+  } else if (rxbytes_now > 61) {
+    // Should not occur in fixed-length mode with PKTLEN=61 (FIFO is 64 bytes).
+    // Can happen if a second packet arrived before we flushed the first (FIFO overflow).
+    ESP_LOGW(TAG, "RXBYTES=%d (>PKTLEN=61) – unexpected, flushing FIFO", rxbytes_now);
+    ELECHOUSE_cc1101.SpiStrobe(0x3A);  // SFRX – flush RX FIFO
+    ELECHOUSE_cc1101.SetRx();
   }
 }
 
@@ -294,27 +303,10 @@ void UponorKnxRf::receive_and_process_() {
     knx_len = raw_len - raw_knx_offset;
     used_manchester = false;
   } else {
-    // Log at INFO when RSSI is strong enough to be a real thermostat packet that
-    // failed to decode (e.g. Filip's transmissions entering the FIFO but decoding wrong).
-    // Weak packets (< -85 dBm) are background noise → stay at DEBUG to reduce log spam.
+    // Strong signal (> -85 dBm) but no KNX header found: interference or collision.
+    // Weak packets are background noise and stay at DEBUG.
     if (rssi_dbm > -85) {
-      ESP_LOGI(TAG, "No KNX header – rssi=%d dBm freqest=%d man_err=%d (strong packet, failed decode)",
-               rssi_dbm, freqest, man_errors);
-      // Dump raw and Manchester-decoded bytes at INFO to help identify the interferer's protocol.
-      {
-        char hex[RAW_BUF_LEN * 3 + 4];
-        int pos = 0;
-        for (int i = 0; i < raw_len && pos < (int)sizeof(hex) - 4; i++)
-          pos += snprintf(hex + pos, sizeof(hex) - pos, "%02X ", raw_buf[i]);
-        ESP_LOGI(TAG, "  RAW [%d]: %s", raw_len, hex);
-      }
-      {
-        char hex[DECODED_BUF_LEN * 3 + 4];
-        int pos = 0;
-        for (int i = 0; i < decoded_len && pos < (int)sizeof(hex) - 4; i++)
-          pos += snprintf(hex + pos, sizeof(hex) - pos, "%02X ", decoded[i]);
-        ESP_LOGI(TAG, "  MAN [%d]: %s", decoded_len, hex);
-      }
+      ESP_LOGI(TAG, "No KNX header – rssi=%d dBm man_err=%d", rssi_dbm, man_errors);
     } else {
       ESP_LOGD(TAG, "No KNX header – rssi=%d dBm man_err=%d (noise)", rssi_dbm, man_errors);
     }
@@ -355,10 +347,7 @@ void UponorKnxRf::receive_and_process_() {
     blk1_crc_ok   = (calc == pkt);
   }
   if (!blk1_crc_ok) {
-    // Drop corrupted frames. Log at INFO so we can track interference frequency.
-    ESP_LOGI(TAG, "CRC FAIL – dropped: rssi=%d dBm freqest=%d man_err=%d serial=%s",
-             rssi_dbm, freqest, man_errors,
-             extract_serial_(knx).c_str());
+    ESP_LOGD(TAG, "CRC FAIL – dropped: rssi=%d dBm man_err=%d", rssi_dbm, man_errors);
     return;
   }
 
