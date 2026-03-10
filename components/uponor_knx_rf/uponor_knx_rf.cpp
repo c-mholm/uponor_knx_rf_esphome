@@ -291,7 +291,14 @@ void UponorKnxRf::receive_and_process_() {
     knx_len = raw_len - raw_knx_offset;
     used_manchester = false;
   } else {
-    ESP_LOGD(TAG, "No KNX RF header (0x44 0xFF) found in packet");
+    // Log at INFO when RSSI is strong enough to be a real thermostat packet that
+    // failed to decode (e.g. Filip's transmissions entering the FIFO but decoding wrong).
+    // Weak packets (< -85 dBm) are background noise → stay at DEBUG to reduce log spam.
+    if (rssi_dbm > -85) {
+      ESP_LOGI(TAG, "No KNX header – rssi=%d dBm man_err=%d (strong packet, failed decode)", rssi_dbm, man_errors);
+    } else {
+      ESP_LOGD(TAG, "No KNX header – rssi=%d dBm man_err=%d (noise)", rssi_dbm, man_errors);
+    }
     return;
   }
 
@@ -301,9 +308,28 @@ void UponorKnxRf::receive_and_process_() {
     return;
   }
 
+  // Recount Manchester errors for the actual KNX frame bytes only.
+  // The full-buffer count (man_errors above) is inflated by post-frame channel noise
+  // that is heavily amplified by the max-sensitivity AGC (AGCCTRL2=0x07): the ~6 decoded
+  // bytes after the real frame arrive as 0xFF/0x00 → up to 8 Manchester violations each
+  // → observed constant ~45 errors on every valid packet regardless of signal quality.
+  // After this recount, man_err reflects only the true decode quality of the KNX frame.
+  if (used_manchester && man_knx_offset >= 0) {
+    uint8_t frame_decoded = (knx[0] + 1 < knx_len) ? (uint8_t)(knx[0] + 1) : knx_len;
+    int frame_raw_start = man_knx_offset * 2;
+    int frame_raw_len   = frame_decoded * 2;
+    if (frame_raw_start + frame_raw_len <= raw_len) {
+      uint8_t tmp[DECODED_BUF_LEN];
+      man_errors = 0;
+      manchester_decode_(raw_buf + frame_raw_start, frame_raw_len, tmp, man_errors);
+    }
+    // If frame extends past FIFO boundary (shouldn't happen for valid packets),
+    // man_errors keeps the inflated full-buffer value.
+  }
+
   // Block 1 CRC diagnostic (bytes 0..9, CRC stored at bytes 10-11)
-  // NOTE: Crc16.h uses CRC-16/CCITT-FALSE (poly 0x1021); KNX RF 1.1 uses EN-13757 (poly 0x3D65).
-  // This is diagnostic-only — do not filter on it until the correct polynomial is confirmed.
+  // Algorithm: CRC-16/EN-13757 (poly=0x3D65, init=0, RefIn/RefOut=true, XorOut=0xFFFF)
+  // blk1_crc=FAIL indicates a corrupted frame; use as a soft filter once confirmed working.
   bool blk1_crc_ok = false;
   if (knx_len >= 12) {
     uint16_t calc = knx_crc16(knx, 10);
